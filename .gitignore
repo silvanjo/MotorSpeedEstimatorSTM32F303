@@ -1,0 +1,54 @@
+# Build artifacts
+build/
+mx.scratch/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+.history/
+
+# IDE - Other
+.settings/
+!.settings
+*.launch
+.cproject
+.project
+
+# Compiled files
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.a
+*.so
+*.axf
+
+# Debug files
+*.d
+*.su
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Documentation files
+*.md
