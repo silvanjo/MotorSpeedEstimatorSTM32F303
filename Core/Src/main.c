@@ -58,6 +58,10 @@ float32_t fft_input[FFT_SIZE];
 float32_t fft_output[FFT_SIZE * 2];  // Complex output: real and imaginary
 float32_t fft_magnitude[FFT_SIZE];
 arm_rfft_fast_instance_f32 fft_instance;
+
+// Voltage measurement variables
+#define VREF 3.3f  // Reference voltage in volts
+#define ADC_MAX 4095.0f  // 12-bit ADC max value (2^12 - 1)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,6 +76,44 @@ static void MX_ADC1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// Calculate and send voltage measurement via UART
+void send_voltage_measurement(uint16_t* adc_data, uint32_t offset)
+{
+  // Calculate average ADC value over FFT_SIZE samples for better accuracy
+  uint32_t adc_sum = 0;
+  uint16_t min_val = 4095;
+  uint16_t max_val = 0;
+
+  for (uint32_t i = 0; i < FFT_SIZE; i++)
+  {
+    uint16_t val = adc_data[offset + i];
+    adc_sum += val;
+    if (val < min_val) min_val = val;
+    if (val > max_val) max_val = val;
+  }
+
+  float avg_adc = (float)adc_sum / (float)FFT_SIZE;
+
+  // Convert ADC value to voltage
+  float voltage = (avg_adc / ADC_MAX) * VREF;
+  float min_voltage = ((float)min_val / ADC_MAX) * VREF;
+  float max_voltage = ((float)max_val / ADC_MAX) * VREF;
+
+  // Send voltage via UART
+  char msg[150];
+  int adc_int = (int)avg_adc;
+  int voltage_mv = (int)(voltage * 1000.0f);  // Convert to millivolts
+  int min_mv = (int)(min_voltage * 1000.0f);
+  int max_mv = (int)(max_voltage * 1000.0f);
+
+  int len = sprintf(msg, "ADC: %d | Voltage: %d.%03d V | Min: %d.%03d V | Max: %d.%03d V\r\n",
+                    adc_int,
+                    voltage_mv / 1000, voltage_mv % 1000,
+                    min_mv / 1000, min_mv % 1000,
+                    max_mv / 1000, max_mv % 1000);
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
+}
 
 // Process FFT on ADC buffer segment
 void process_fft(uint16_t* adc_data, uint32_t offset)
@@ -108,9 +150,13 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
   float32_t peak_frequency = max_index * frequency_resolution;
 
   // Send peak frequency via UART
-  char msg[100];
-  int len = sprintf(msg, "Peak Frequency: %.2f Hz (bin %u, magnitude: %.0f)\r\n",
-                    peak_frequency, (unsigned int)max_index, max_value);
+  char msg[120];
+  int freq_hz = (int)peak_frequency;
+  int freq_decimal = (int)((peak_frequency - freq_hz) * 100.0f);  // 2 decimal places
+  int magnitude_int = (int)max_value;
+
+  int len = sprintf(msg, "Peak Frequency: %d.%02d Hz (bin %u, magnitude: %d)\r\n",
+                    freq_hz, freq_decimal, (unsigned int)max_index, magnitude_int);
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
 }
 
@@ -174,10 +220,30 @@ int main(void)
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
 
   // Calibrate ADC
-  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  HAL_StatusTypeDef cal_status = HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  if (cal_status == HAL_OK)
+  {
+    uint8_t cal_ok[] = "ADC calibration successful\r\n";
+    HAL_UART_Transmit(&huart2, cal_ok, sizeof(cal_ok) - 1, 100);
+  }
+  else
+  {
+    uint8_t cal_err[] = "ADC calibration FAILED!\r\n";
+    HAL_UART_Transmit(&huart2, cal_err, sizeof(cal_err) - 1, 100);
+  }
 
-  // Start ADC with DMA - buffer of 4096 samples
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
+  // Start ADC with DMA
+  HAL_StatusTypeDef adc_status = HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
+  if (adc_status == HAL_OK)
+  {
+    uint8_t adc_ok[] = "ADC DMA started successfully\r\n";
+    HAL_UART_Transmit(&huart2, adc_ok, sizeof(adc_ok) - 1, 100);
+  }
+  else
+  {
+    uint8_t adc_err[] = "ADC DMA start FAILED!\r\n";
+    HAL_UART_Transmit(&huart2, adc_err, sizeof(adc_err) - 1, 100);
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -193,6 +259,7 @@ int main(void)
     {
       buffer_half_full_flag = 0;
       // Process first half of buffer: adc_buffer[0] to adc_buffer[2047]
+      send_voltage_measurement(adc_buffer, 0);
       process_fft(adc_buffer, 0);
     }
 
@@ -201,6 +268,7 @@ int main(void)
     {
       buffer_full_flag = 0;
       // Process second half of buffer: adc_buffer[2048] to adc_buffer[4095]
+      send_voltage_measurement(adc_buffer, 2048);
       process_fft(adc_buffer, 2048);
     }
   }
