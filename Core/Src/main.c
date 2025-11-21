@@ -57,11 +57,15 @@ volatile uint8_t buffer_full_flag = 0;
 float32_t fft_input[FFT_SIZE];
 float32_t fft_output[FFT_SIZE * 2];  // Complex output: real and imaginary
 float32_t fft_magnitude[FFT_SIZE];
+float32_t hann_window[FFT_SIZE];  // Hann window coefficients
 arm_rfft_fast_instance_f32 fft_instance;
 
 // Voltage measurement variables
 #define VREF 3.3f  // Reference voltage in volts
 #define ADC_MAX 4095.0f  // 12-bit ADC max value (2^12 - 1)
+
+// Overlap buffer for 50% overlap processing
+uint16_t overlap_buffer[FFT_SIZE / 2];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,6 +80,17 @@ static void MX_ADC1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// Initialize Hann window coefficients
+void init_hann_window(void)
+{
+  const float32_t pi = 3.14159265358979323846f;
+  for (uint32_t i = 0; i < FFT_SIZE; i++)
+  {
+    // Hann window: w(n) = 0.5 * (1 - cos(2*pi*n/(N-1)))
+    hann_window[i] = 0.5f * (1.0f - arm_cos_f32(2.0f * pi * i / (FFT_SIZE - 1)));
+  }
+}
 
 // Calculate and send voltage measurement via UART
 void send_voltage_measurement(uint16_t* adc_data, uint32_t offset)
@@ -115,13 +130,14 @@ void send_voltage_measurement(uint16_t* adc_data, uint32_t offset)
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
 }
 
-// Process FFT on ADC buffer segment
+// Process FFT on ADC buffer segment with Hann windowing
 void process_fft(uint16_t* adc_data, uint32_t offset)
 {
-  // Convert ADC values (uint16_t) to float32_t
+  // Convert ADC values to float32_t and apply Hann window
   for (uint32_t i = 0; i < FFT_SIZE; i++)
   {
-    fft_input[i] = (float32_t) adc_data[offset + i];
+    // Apply window function to reduce spectral leakage
+    fft_input[i] = (float32_t)adc_data[offset + i] * hann_window[i];
   }
 
   // Perform FFT
@@ -145,7 +161,7 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
 
   // Calculate frequency in Hz
   // Sample rate = 72MHz / (601.5 + 12.5) ADC cycles = 72MHz / 614 = ~117.3 kSPS
-  const float32_t sample_rate = 117300.0f;  // Hz (approximately)
+  const float32_t sample_rate = 117300.0f;  // Hz
   float32_t frequency_resolution = sample_rate / FFT_SIZE;
   float32_t peak_frequency = max_index * frequency_resolution;
 
@@ -158,6 +174,25 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
   int len = sprintf(msg, "Peak Frequency: %d.%02d Hz (bin %u, magnitude: %d)\r\n",
                     freq_hz, freq_decimal, (unsigned int)max_index, magnitude_int);
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
+}
+
+// Process FFT with 50% overlap using stored overlap buffer
+void process_fft_with_overlap(uint16_t* new_data, uint32_t offset)
+{
+  // Create a temporary buffer combining overlap + new data
+  static uint16_t combined_buffer[FFT_SIZE];
+
+  // First half: use stored overlap data from previous iteration
+  memcpy(combined_buffer, overlap_buffer, (FFT_SIZE / 2) * sizeof(uint16_t));
+
+  // Second half: use new data
+  memcpy(&combined_buffer[FFT_SIZE / 2], &new_data[offset], (FFT_SIZE / 2) * sizeof(uint16_t));
+
+  // Store second half of new data for next overlap
+  memcpy(overlap_buffer, &new_data[offset + (FFT_SIZE / 2)], (FFT_SIZE / 2) * sizeof(uint16_t));
+
+  // Process FFT on combined buffer with windowing
+  process_fft(combined_buffer, 0);
 }
 
 // DMA half-transfer complete callback
@@ -219,6 +254,17 @@ int main(void)
   // Initialize FFT instance
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
 
+  // Initialize Hann window coefficients for spectral leakage reduction
+  init_hann_window();
+  uint8_t window_msg[] = "Hann window initialized\r\n";
+  HAL_UART_Transmit(&huart2, window_msg, sizeof(window_msg) - 1, 100);
+
+  // Initialize overlap buffer with zeros for 50% overlap processing
+  for (uint32_t i = 0; i < FFT_SIZE / 2; i++)
+  {
+    overlap_buffer[i] = 0;
+  }
+
   // Calibrate ADC
   HAL_StatusTypeDef cal_status = HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   if (cal_status == HAL_OK)
@@ -258,18 +304,21 @@ int main(void)
     if (buffer_half_full_flag)
     {
       buffer_half_full_flag = 0;
-      // Process first half of buffer: adc_buffer[0] to adc_buffer[2047]
+      // Process first half of buffer with 50% overlap
       send_voltage_measurement(adc_buffer, 0);
-      process_fft(adc_buffer, 0);
+
+      // Process overlapping FFT windows
+      process_fft_with_overlap(adc_buffer, 0);
     }
 
     // Check if buffer is full
     if (buffer_full_flag)
     {
       buffer_full_flag = 0;
-      // Process second half of buffer: adc_buffer[2048] to adc_buffer[4095]
-      send_voltage_measurement(adc_buffer, 2048);
-      process_fft(adc_buffer, 2048);
+      // Process second half of buffer with 50% overlap
+      send_voltage_measurement(adc_buffer, ADC_BUFFER_SIZE / 2);
+
+      process_fft_with_overlap(adc_buffer, ADC_BUFFER_SIZE / 2);
     }
   }
   /* USER CODE END 3 */
