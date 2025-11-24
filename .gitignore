@@ -35,7 +35,6 @@ _deps/
 *.hex
 *.map
 *.lst
-*.a
 *.so
 *.axf
 

@@ -93,6 +93,7 @@ void init_hann_window(void)
 }
 
 // Calculate and send voltage measurement via UART
+// TODO: The overlapping logic does not seem to work
 void send_voltage_measurement(uint16_t* adc_data, uint32_t offset)
 {
   // Calculate average ADC value over FFT_SIZE samples for better accuracy
@@ -144,6 +145,7 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
   arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
 
   // Calculate magnitude spectrum
+  // TODO: I think only have of the fft length is required
   arm_cmplx_mag_f32(fft_output, fft_magnitude, FFT_SIZE);
 
   // Find peak frequency (skip DC component at index 0)
