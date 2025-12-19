@@ -52,6 +52,12 @@ DMA_HandleTypeDef hdma_adc1;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart1_tx;
+DMA_HandleTypeDef hdma_usart2_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
+DMA_HandleTypeDef hdma_usart3_rx;
+DMA_HandleTypeDef hdma_usart3_tx;
 
 /* USER CODE BEGIN PV */
 
@@ -79,6 +85,30 @@ arm_rfft_fast_instance_f32 fft_instance;
 #define VREF 3.3f  // Reference voltage in volts
 #define ADC_MAX 4095.0f  // 12-bit ADC max value (2^12 - 1)
 
+// UART DMA receive buffers and flags
+#define UART_RX_BUFFER_SIZE 128
+#define UART_TX_BUFFER_SIZE 256
+
+uint8_t uart1_rx_buffer[UART_RX_BUFFER_SIZE];
+uint8_t uart2_rx_buffer[UART_RX_BUFFER_SIZE];
+uint8_t uart3_rx_buffer[UART_RX_BUFFER_SIZE];
+
+uint8_t uart1_tx_buffer[UART_TX_BUFFER_SIZE];
+uint8_t uart2_tx_buffer[UART_TX_BUFFER_SIZE];
+uint8_t uart3_tx_buffer[UART_TX_BUFFER_SIZE];
+
+volatile uint8_t uart1_rx_flag = 0;
+volatile uint8_t uart2_rx_flag = 0;
+volatile uint8_t uart3_rx_flag = 0;
+
+volatile uint8_t uart1_tx_complete = 1;
+volatile uint8_t uart2_tx_complete = 1;
+volatile uint8_t uart3_tx_complete = 1;
+
+volatile uint16_t uart1_rx_len = 0;
+volatile uint16_t uart2_rx_len = 0;
+volatile uint16_t uart3_rx_len = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -100,73 +130,37 @@ static void MX_USART3_UART_Init(void);
 DEBUGGING FUNCTIONS
 */
 
-void test_uart() {
-  uint8_t rx_buffer[64];
-  uint8_t tx_buffer[128];
-  uint8_t rx_byte;
-  uint8_t rx_index;
-
-  // Test UART1: Wait for message, echo back with ACK
-  uint8_t uart1_ready[] = "UART1 ready, send message (end with Enter):\r\n";
-  HAL_UART_Transmit(&huart1, uart1_ready, sizeof(uart1_ready) - 1, 100);
-  memset(rx_buffer, 0, sizeof(rx_buffer));
-  rx_index = 0;
-  while (rx_index < sizeof(rx_buffer) - 1)
+/* When a message is received on a UART port it will be send back with a ACK. */
+void poll_uart() {
+  // Handle UART1 received message
+  if (uart1_rx_flag && uart1_tx_complete)
   {
-    if (HAL_UART_Receive(&huart1, &rx_byte, 1, 30000) == HAL_OK)
-    {
-      if (rx_byte == '\n' || rx_byte == '\r') break;
-      rx_buffer[rx_index++] = rx_byte;
-    }
-    else break;  // Timeout
-  }
-  if (rx_index > 0)
-  {
-    int len = sprintf((char*)tx_buffer, "ACK UART1: %s\r\n", rx_buffer);
-    HAL_UART_Transmit(&huart1, tx_buffer, len, 100);
+    uart1_rx_flag = 0;
+    uart1_tx_complete = 0;
+    // Echo back with ACK using DMA
+    int len = sprintf((char*)uart1_tx_buffer, "ACK UART1 (%d bytes): %.*s\r\n", uart1_rx_len, uart1_rx_len, uart1_rx_buffer);
+    HAL_UART_Transmit_DMA(&huart1, uart1_tx_buffer, len);
   }
 
-  // Test UART2: Wait for message, echo back with ACK
-  uint8_t uart2_ready[] = "UART2 ready, send message (end with Enter):\r\n";
-  HAL_UART_Transmit(&huart2, uart2_ready, sizeof(uart2_ready) - 1, 100);
-  memset(rx_buffer, 0, sizeof(rx_buffer));
-  rx_index = 0;
-  while (rx_index < sizeof(rx_buffer) - 1)
+  // Handle UART2 received message
+  if (uart2_rx_flag && uart2_tx_complete)
   {
-    if (HAL_UART_Receive(&huart2, &rx_byte, 1, 30000) == HAL_OK)
-    {
-      if (rx_byte == '\n' || rx_byte == '\r') break;
-      rx_buffer[rx_index++] = rx_byte;
-    }
-    else break;  // Timeout
-  }
-  if (rx_index > 0)
-  {
-    int len = sprintf((char*)tx_buffer, "ACK UART2: %s\r\n", rx_buffer);
-    HAL_UART_Transmit(&huart2, tx_buffer, len, 100);
+    uart2_rx_flag = 0;
+    uart2_tx_complete = 0;
+    // Echo back with ACK using DMA
+    int len = sprintf((char*)uart2_tx_buffer, "ACK UART2 (%d bytes): %.*s\r\n", uart2_rx_len, uart2_rx_len, uart2_rx_buffer);
+    HAL_UART_Transmit_DMA(&huart2, uart2_tx_buffer, len);
   }
 
-  // Test UART3: Wait for message, echo back with ACK
-  /*
-  uint8_t uart3_ready[] = "UART3 ready, send message (end with Enter):\r\n";
-  HAL_UART_Transmit(&huart3, uart3_ready, sizeof(uart3_ready) - 1, 100);
-  memset(rx_buffer, 0, sizeof(rx_buffer));
-  rx_index = 0;
-  while (rx_index < sizeof(rx_buffer) - 1)
+  // Handle UART3 received message
+  if (uart3_rx_flag && uart3_tx_complete)
   {
-    if (HAL_UART_Receive(&huart3, &rx_byte, 1, 30000) == HAL_OK)
-    {
-      if (rx_byte == '\n' || rx_byte == '\r') break;
-      rx_buffer[rx_index++] = rx_byte;
-    }
-    else break;  // Timeout
+    uart3_rx_flag = 0;
+    uart3_tx_complete = 0;
+    // Echo back with ACK using DMA
+    int len = sprintf((char*)uart3_tx_buffer, "ACK UART3 (%d bytes): %.*s\r\n", uart3_rx_len, uart3_rx_len, uart3_rx_buffer);
+    HAL_UART_Transmit_DMA(&huart3, uart3_tx_buffer, len);
   }
-  if (rx_index > 0)
-  {
-    int len = sprintf((char*)tx_buffer, "ACK UART3: %s\r\n", rx_buffer);
-    HAL_UART_Transmit(&huart3, tx_buffer, len, 100);
-  }
-  */
 }
 
 // Calculate and send voltage measurement via UART
@@ -323,6 +317,52 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   }
 }
 
+// UART TX complete callback (called when DMA transmission finishes)
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    uart1_tx_complete = 1;
+  }
+  else if (huart->Instance == USART2)
+  {
+    uart2_tx_complete = 1;
+  }
+  else if (huart->Instance == USART3)
+  {
+    uart3_tx_complete = 1;
+  }
+}
+
+// UART RX Event callback (called on IDLE line detection or buffer full)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+  if (huart->Instance == USART1)
+  {
+    uart1_rx_len = Size;
+    uart1_rx_flag = 1;
+    // Restart DMA reception for next message
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart1_rx_buffer, UART_RX_BUFFER_SIZE);
+    __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+  }
+  else if (huart->Instance == USART2)
+  {
+    uart2_rx_len = Size;
+    uart2_rx_flag = 1;
+    // Restart DMA reception for next message
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart2_rx_buffer, UART_RX_BUFFER_SIZE);
+    __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+  }
+  else if (huart->Instance == USART3)
+  {
+    uart3_rx_len = Size;
+    uart3_rx_flag = 1;
+    // Restart DMA reception for next message
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uart3_rx_buffer, UART_RX_BUFFER_SIZE);
+    __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -359,10 +399,20 @@ int main(void)
   MX_ADC1_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
-
   /* USER CODE BEGIN 2 */
-  
-  // test_uart();
+
+  // Start UART DMA reception with IDLE line detection
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart1_rx_buffer, UART_RX_BUFFER_SIZE);
+  __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart2_rx_buffer, UART_RX_BUFFER_SIZE);
+  __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uart3_rx_buffer, UART_RX_BUFFER_SIZE);
+  __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+
+  uint8_t uart_ready_msg[] = "UART DMA IDLE detection started\r\n";
+  HAL_UART_Transmit(&huart2, uart_ready_msg, sizeof(uart_ready_msg) - 1, 100);
 
   // Initialize FFT instance
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
@@ -406,20 +456,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    poll_uart();
 
     // Check if buffer is half full
     if (buffer_half_full_flag)
     {
       buffer_half_full_flag = 0;
-      process_fft(input_buffer, 0);
+      // process_fft(input_buffer, 0);
     }
 
     // Check if buffer is full
     if (buffer_full_flag)
     {
       buffer_full_flag = 0;
-      process_fft(input_buffer, ADC_BUFFER_SIZE / 2);
+      // process_fft(input_buffer, ADC_BUFFER_SIZE / 2);
     }
+
   }
   /* USER CODE END 3 */
 }
@@ -658,6 +710,24 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+  /* DMA1_Channel6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
+  /* DMA1_Channel7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
 
 }
 
