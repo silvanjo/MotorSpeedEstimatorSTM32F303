@@ -22,10 +22,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
-#include <stdbool.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "arm_math.h"
+#include "stm32f3xx_hal_uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,7 +49,9 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 
@@ -84,6 +87,8 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -94,6 +99,75 @@ static void MX_ADC1_Init(void);
 /*
 DEBUGGING FUNCTIONS
 */
+
+void test_uart() {
+  uint8_t rx_buffer[64];
+  uint8_t tx_buffer[128];
+  uint8_t rx_byte;
+  uint8_t rx_index;
+
+  // Test UART1: Wait for message, echo back with ACK
+  uint8_t uart1_ready[] = "UART1 ready, send message (end with Enter):\r\n";
+  HAL_UART_Transmit(&huart1, uart1_ready, sizeof(uart1_ready) - 1, 100);
+  memset(rx_buffer, 0, sizeof(rx_buffer));
+  rx_index = 0;
+  while (rx_index < sizeof(rx_buffer) - 1)
+  {
+    if (HAL_UART_Receive(&huart1, &rx_byte, 1, 30000) == HAL_OK)
+    {
+      if (rx_byte == '\n' || rx_byte == '\r') break;
+      rx_buffer[rx_index++] = rx_byte;
+    }
+    else break;  // Timeout
+  }
+  if (rx_index > 0)
+  {
+    int len = sprintf((char*)tx_buffer, "ACK UART1: %s\r\n", rx_buffer);
+    HAL_UART_Transmit(&huart1, tx_buffer, len, 100);
+  }
+
+  // Test UART2: Wait for message, echo back with ACK
+  uint8_t uart2_ready[] = "UART2 ready, send message (end with Enter):\r\n";
+  HAL_UART_Transmit(&huart2, uart2_ready, sizeof(uart2_ready) - 1, 100);
+  memset(rx_buffer, 0, sizeof(rx_buffer));
+  rx_index = 0;
+  while (rx_index < sizeof(rx_buffer) - 1)
+  {
+    if (HAL_UART_Receive(&huart2, &rx_byte, 1, 30000) == HAL_OK)
+    {
+      if (rx_byte == '\n' || rx_byte == '\r') break;
+      rx_buffer[rx_index++] = rx_byte;
+    }
+    else break;  // Timeout
+  }
+  if (rx_index > 0)
+  {
+    int len = sprintf((char*)tx_buffer, "ACK UART2: %s\r\n", rx_buffer);
+    HAL_UART_Transmit(&huart2, tx_buffer, len, 100);
+  }
+
+  // Test UART3: Wait for message, echo back with ACK
+  /*
+  uint8_t uart3_ready[] = "UART3 ready, send message (end with Enter):\r\n";
+  HAL_UART_Transmit(&huart3, uart3_ready, sizeof(uart3_ready) - 1, 100);
+  memset(rx_buffer, 0, sizeof(rx_buffer));
+  rx_index = 0;
+  while (rx_index < sizeof(rx_buffer) - 1)
+  {
+    if (HAL_UART_Receive(&huart3, &rx_byte, 1, 30000) == HAL_OK)
+    {
+      if (rx_byte == '\n' || rx_byte == '\r') break;
+      rx_buffer[rx_index++] = rx_byte;
+    }
+    else break;  // Timeout
+  }
+  if (rx_index > 0)
+  {
+    int len = sprintf((char*)tx_buffer, "ACK UART3: %s\r\n", rx_buffer);
+    HAL_UART_Transmit(&huart3, tx_buffer, len, 100);
+  }
+  */
+}
 
 // Calculate and send voltage measurement via UART
 void send_voltage_measurement_uart(UART_HandleTypeDef* uart_port, uint16_t* adc_data, uint32_t offset)
@@ -283,9 +357,12 @@ int main(void)
   MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_USART1_UART_Init();
+  MX_USART3_UART_Init();
+
   /* USER CODE BEGIN 2 */
-  uint8_t init_msg[] = "System initialized successfully!\r\n";
-  HAL_UART_Transmit(&huart2, init_msg, sizeof(init_msg) - 1, 100);
+  
+  // test_uart();
 
   // Initialize FFT instance
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
@@ -385,8 +462,11 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2|RCC_PERIPHCLK_ADC12;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_USART2
+                              |RCC_PERIPHCLK_USART3|RCC_PERIPHCLK_ADC12;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
   PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
+  PeriphClkInit.Usart3ClockSelection = RCC_USART3CLKSOURCE_PCLK1;
   PeriphClkInit.Adc12ClockSelection = RCC_ADC12PLLCLK_DIV1;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
@@ -461,6 +541,41 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -492,6 +607,41 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
 
 }
 
