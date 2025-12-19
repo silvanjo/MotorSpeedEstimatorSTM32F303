@@ -65,7 +65,7 @@ bool input_adc = true;    /* If true the input buffer will be filled with data f
 bool input_uart = false;  /* If true the input buffer will be filled with data from uart */
 
 /* 
-Is is the input buffer for the MOPA algorithm. It will either be filled using
+This is the input buffer for the MOPA algorithm. It will either be filled using
 ADC or with data send from UART. 
 */
 uint16_t input_buffer[ADC_BUFFER_SIZE];
@@ -215,6 +215,64 @@ void init_hann_window(void)
     // Hann window: w(n) = 0.5 * (1 - cos(2*pi*n/(N-1)))
     hann_window[i] = 0.5f * (1.0f - arm_cos_f32(2.0f * pi * i / (FFT_SIZE - 1)));
   }
+}
+
+/*
+COBS
+*/
+
+/* COBS encode: transforms data so it contains no 0x00 bytes */
+static uint16_t cobs_encode(const uint8_t* input, uint16_t len, uint8_t* output) {
+  uint16_t read_idx = 0;
+  uint16_t write_idx = 1;
+  uint16_t code_idx = 0;
+  uint8_t code = 1;
+
+  while (read_idx < len) {
+    if (input[read_idx] == 0x00) {
+      output[code_idx] = code;
+      code_idx = write_idx++;
+      code = 1;
+    } else {
+      output[write_idx++] = input[read_idx];
+      code++;
+      if (code == 0xFF) {
+        output[code_idx] = code;
+        code_idx = write_idx++;
+        code = 1;
+      }
+    }
+    read_idx++;
+  }
+  output[code_idx] = code;
+  return write_idx;
+}
+
+/* COBS decode: restores original data from COBS-encoded data */
+static int16_t cobs_decode(const uint8_t* input, uint16_t len, uint8_t* output) {
+  uint16_t read_idx = 0;
+  uint16_t write_idx = 0;
+
+  while (read_idx < len) {
+    uint8_t code = input[read_idx++];
+    if (code == 0) return -1; // Invalid COBS
+
+    for (uint8_t i = 1; i < code; i++) {
+      if (read_idx >= len) return -1; // Truncated
+      output[write_idx++] = input[read_idx++];
+    }
+
+    if (code < 0xFF && read_idx < len) {
+      output[write_idx++] = 0x00;
+    }
+  }
+
+  // Remove trailing zero if present
+  if (write_idx > 0 && output[write_idx - 1] == 0x00) {
+    write_idx--;
+  }
+
+  return write_idx;
 }
 
 /*
