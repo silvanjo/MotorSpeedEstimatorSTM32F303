@@ -21,9 +21,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "arm_math.h"
-#include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include "arm_math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,7 +51,16 @@ DMA_HandleTypeDef hdma_adc1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint16_t adc_buffer[ADC_BUFFER_SIZE];
+
+bool input_adc = true;    /* If true the input buffer will be filled with data from the adc */
+bool input_uart = false;  /* If true the input buffer will be filled with data from uart */
+
+/* 
+Is is the input buffer for the MOPA algorithm. It will either be filled using
+ADC or with data send from UART. 
+*/
+uint16_t input_buffer[ADC_BUFFER_SIZE];
+
 volatile uint8_t buffer_half_full_flag = 0;
 volatile uint8_t buffer_full_flag = 0;
 
@@ -58,13 +69,13 @@ float32_t fft_input[FFT_SIZE];
 float32_t fft_output[FFT_SIZE * 2];  // Complex output: real and imaginary
 float32_t fft_magnitude[FFT_SIZE];
 float32_t hann_window[FFT_SIZE];  // Hann window coefficients
+
 arm_rfft_fast_instance_f32 fft_instance;
 
 // Voltage measurement variables
 #define VREF 3.3f  // Reference voltage in volts
 #define ADC_MAX 4095.0f  // 12-bit ADC max value (2^12 - 1)
 
-// Overlap buffer for 50% overlap processing
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -80,19 +91,12 @@ static void MX_ADC1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// Initialize Hann window coefficients
-void init_hann_window(void)
-{
-  const float32_t pi = 3.14159265358979323846f;
-  for (uint32_t i = 0; i < FFT_SIZE; i++)
-  {
-    // Hann window: w(n) = 0.5 * (1 - cos(2*pi*n/(N-1)))
-    hann_window[i] = 0.5f * (1.0f - arm_cos_f32(2.0f * pi * i / (FFT_SIZE - 1)));
-  }
-}
+/*
+DEBUGGING FUNCTIONS
+*/
 
 // Calculate and send voltage measurement via UART
-void send_voltage_measurement(uint16_t* adc_data, uint32_t offset)
+void send_voltage_measurement_uart(UART_HandleTypeDef* uart_port, uint16_t* adc_data, uint32_t offset)
 {
   // Calculate average ADC value over half buffer size (new data only)
   uint32_t half_size = FFT_SIZE / 2;
@@ -127,11 +131,30 @@ void send_voltage_measurement(uint16_t* adc_data, uint32_t offset)
                     voltage_mv / 1000, voltage_mv % 1000,
                     min_mv / 1000, min_mv % 1000,
                     max_mv / 1000, max_mv % 1000);
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
+  HAL_UART_Transmit(uart_port, (uint8_t*)msg, len, 1000);
 }
 
+/*
+HELPER FUNCTIONS
+*/
+
+// Initialize Hann window coefficients
+void init_hann_window(void)
+{
+  const float32_t pi = 3.14159265358979323846f;
+  for (uint32_t i = 0; i < FFT_SIZE; i++)
+  {
+    // Hann window: w(n) = 0.5 * (1 - cos(2*pi*n/(N-1)))
+    hann_window[i] = 0.5f * (1.0f - arm_cos_f32(2.0f * pi * i / (FFT_SIZE - 1)));
+  }
+}
+
+/*
+MOPA FUNCTIONS
+*/
+
 // Process FFT on ADC buffer segment with Hann windowing
-void process_fft(uint16_t* adc_data, uint32_t offset)
+void process_fft(uint16_t* input, uint32_t offset)
 {
   uint32_t half_size = FFT_SIZE / 2;
   uint32_t old_data_offset;
@@ -149,12 +172,12 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
   float32_t dc_sum = 0.0f;
   for (uint32_t i = 0; i < half_size; i++)
   {
-      fft_input[i] = (float32_t)adc_data[old_data_offset + i];
+      fft_input[i] = (float32_t) input[old_data_offset + i];
       dc_sum += fft_input[i];
   }
   for (uint32_t i = 0; i < half_size; i++)
   {
-      fft_input[i + half_size] = (float32_t)adc_data[offset + i];
+      fft_input[i + half_size] = (float32_t) input[offset + i];
       dc_sum += fft_input[i + half_size];
   }
 
@@ -175,7 +198,7 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
   arm_cmplx_mag_f32(fft_output, fft_magnitude, FFT_SIZE);
 
   // Find peak frequency (skip DC component at index 0)
-  uint32_t max_index = 3;
+  uint32_t max_index = 5;
   float32_t max_value = fft_magnitude[1];
 
   for (uint32_t i = 2; i < FFT_SIZE / 2; i++)  // Only search first half up to Nyquist
@@ -203,6 +226,10 @@ void process_fft(uint16_t* adc_data, uint32_t offset)
                     freq_hz, freq_decimal, (unsigned int)max_index, magnitude_int);
   HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
 }
+
+/*
+INTERRPUT ROUTINES
+*/
 
 // DMA half-transfer complete callback
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
@@ -282,7 +309,7 @@ int main(void)
   }
 
   // Start ADC with DMA
-  HAL_StatusTypeDef adc_status = HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUFFER_SIZE);
+  HAL_StatusTypeDef adc_status = HAL_ADC_Start_DMA(&hadc1, (uint32_t*) input_buffer, ADC_BUFFER_SIZE);
   if (adc_status == HAL_OK)
   {
     uint8_t adc_ok[] = "ADC DMA started successfully\r\n";
@@ -307,21 +334,14 @@ int main(void)
     if (buffer_half_full_flag)
     {
       buffer_half_full_flag = 0;
-      // Process first half of buffer with 50% overlap
-      send_voltage_measurement(adc_buffer, 0);
-
-      // Process overlapping FFT windows
-      process_fft(adc_buffer, 0);
+      process_fft(input_buffer, 0);
     }
 
     // Check if buffer is full
     if (buffer_full_flag)
     {
       buffer_full_flag = 0;
-      // Process second half of buffer with 50% overlap
-      send_voltage_measurement(adc_buffer, ADC_BUFFER_SIZE / 2);
-
-      process_fft(adc_buffer, ADC_BUFFER_SIZE / 2);
+      process_fft(input_buffer, ADC_BUFFER_SIZE / 2);
     }
   }
   /* USER CODE END 3 */
