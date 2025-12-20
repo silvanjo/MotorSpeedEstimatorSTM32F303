@@ -588,7 +588,7 @@ int main(void)
   __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
 
   uint8_t uart_ready_msg[] = "UART DMA IDLE detection started\r\n";
-  HAL_UART_Transmit(&huart2, uart_ready_msg, sizeof(uart_ready_msg) - 1, 100);
+  HAL_UART_Transmit(&huart3, uart_ready_msg, sizeof(uart_ready_msg) - 1, 100);
 
   // Initialize FFT instance
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
@@ -596,19 +596,19 @@ int main(void)
   // Initialize Hann window coefficients for spectral leakage reduction
   init_hann_window();
   uint8_t window_msg[] = "Hann window initialized\r\n";
-  HAL_UART_Transmit(&huart2, window_msg, sizeof(window_msg) - 1, 100);
+  HAL_UART_Transmit(&huart3, window_msg, sizeof(window_msg) - 1, 100);
 
   // Calibrate ADC
   HAL_StatusTypeDef cal_status = HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   if (cal_status == HAL_OK)
   {
     uint8_t cal_ok[] = "ADC calibration successful\r\n";
-    HAL_UART_Transmit(&huart2, cal_ok, sizeof(cal_ok) - 1, 100);
+    HAL_UART_Transmit(&huart3, cal_ok, sizeof(cal_ok) - 1, 100);
   }
   else
   {
     uint8_t cal_err[] = "ADC calibration FAILED!\r\n";
-    HAL_UART_Transmit(&huart2, cal_err, sizeof(cal_err) - 1, 100);
+    HAL_UART_Transmit(&huart3, cal_err, sizeof(cal_err) - 1, 100);
   }
 
   // Start ADC with DMA
@@ -616,12 +616,12 @@ int main(void)
   if (adc_status == HAL_OK)
   {
     uint8_t adc_ok[] = "ADC DMA started successfully\r\n";
-    HAL_UART_Transmit(&huart2, adc_ok, sizeof(adc_ok) - 1, 100);
+    HAL_UART_Transmit(&huart3, adc_ok, sizeof(adc_ok) - 1, 100);
   }
   else
   {
     uint8_t adc_err[] = "ADC DMA start FAILED!\r\n";
-    HAL_UART_Transmit(&huart2, adc_err, sizeof(adc_err) - 1, 100);
+    HAL_UART_Transmit(&huart3, adc_err, sizeof(adc_err) - 1, 100);
   }
 
   // Send initial ready message to indicate we can receive COBS packets
@@ -635,28 +635,37 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    poll_uart();
+    // poll_uart();
 
-    // Process COBS packets from queue
-    if (cobs_packet_queue_has_packet(&cobs_rx_queue)) {
+    // Process COBS packets from queue - echo on UART2
+    if (cobs_packet_queue_has_packet(&cobs_rx_queue) && uart2_tx_complete) {
       uint8_t packet[COBS_MAX_PACKET_SIZE];
       uint16_t packet_len = cobs_packet_queue_pop(&cobs_rx_queue, packet, COBS_MAX_PACKET_SIZE);
       if (packet_len > 0) {
-        // TODO: Process the decoded packet here
-        // For now, echo packet info to UART2 for debugging
-        char msg[64];
-        int len = sprintf(msg, "COBS packet received: %d bytes\r\n", packet_len);
-        HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);
+        // Debug: log that we're echoing
+        char dbg[64];
+        int dbg_len = sprintf(dbg, "Echoing %d bytes on UART2\r\n", packet_len);
+        HAL_UART_Transmit(&huart3, (uint8_t*)dbg, dbg_len, 100);
+
+        // Echo received packet back as COBS on UART2 using DMA
+        uart2_tx_buffer[0] = 0x00;  // Start delimiter
+        uint16_t encoded_len = cobs_encode(packet, packet_len, &uart2_tx_buffer[1]);
+        uart2_tx_buffer[1 + encoded_len] = 0x00;  // End delimiter
+
+        uart2_tx_complete = 0;
+        HAL_UART_Transmit_DMA(&huart2, uart2_tx_buffer, encoded_len + 2);
       }
 
-      // Send ready message if there's space for more packets
+      // Send ready/ACK on UART1 after queuing the echo
       cobs_send_ready();
     }
 
-    // Periodically check if we can send ready (in case TX completed)
+    // Send ready message if UART1 TX complete and queue has space
+    /*
     if (uart1_tx_complete && cobs_packet_queue_has_space(&cobs_rx_queue)) {
       cobs_send_ready();
     }
+    */
 
     // Check if buffer is half full
     if (buffer_half_full_flag)
