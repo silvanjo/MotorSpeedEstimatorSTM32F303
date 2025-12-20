@@ -36,8 +36,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define UART_PACKET_SIZE 512
 #define ADC_BUFFER_SIZE 2048
+#define RINGBUFFER_SIZE 2048
 #define FFT_SIZE ADC_BUFFER_SIZE
+
+#define COBS_MAX_PACKET_SIZE UART_PACKET_SIZE
+#define COBS_PACKET_QUEUE_SLOTS 8
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -86,16 +91,13 @@ arm_rfft_fast_instance_f32 fft_instance;
 #define ADC_MAX 4095.0f  // 12-bit ADC max value (2^12 - 1)
 
 // UART DMA receive buffers and flags
-#define UART_RX_BUFFER_SIZE 128
-#define UART_TX_BUFFER_SIZE 256
+uint8_t uart1_rx_buffer[UART_PACKET_SIZE];
+uint8_t uart2_rx_buffer[UART_PACKET_SIZE];
+uint8_t uart3_rx_buffer[UART_PACKET_SIZE];
 
-uint8_t uart1_rx_buffer[UART_RX_BUFFER_SIZE];
-uint8_t uart2_rx_buffer[UART_RX_BUFFER_SIZE];
-uint8_t uart3_rx_buffer[UART_RX_BUFFER_SIZE];
-
-uint8_t uart1_tx_buffer[UART_TX_BUFFER_SIZE];
-uint8_t uart2_tx_buffer[UART_TX_BUFFER_SIZE];
-uint8_t uart3_tx_buffer[UART_TX_BUFFER_SIZE];
+uint8_t uart1_tx_buffer[UART_PACKET_SIZE];
+uint8_t uart2_tx_buffer[UART_PACKET_SIZE];
+uint8_t uart3_tx_buffer[UART_PACKET_SIZE];
 
 volatile uint8_t uart1_rx_flag = 0;
 volatile uint8_t uart2_rx_flag = 0;
@@ -109,15 +111,28 @@ volatile uint16_t uart1_rx_len = 0;
 volatile uint16_t uart2_rx_len = 0;
 volatile uint16_t uart3_rx_len = 0;
 
-#define RINGBUFFER_SIZE 2048
-
+/* COBS Packet Queue - stores complete decoded packets */
 typedef struct {
-  volatile uint16_t write_head;
-  volatile uint16_t read_head;
-  uint8_t data[RINGBUFFER_SIZE];
-} ringbuffer_t;
+  uint8_t data[COBS_PACKET_QUEUE_SLOTS][COBS_MAX_PACKET_SIZE];
+  uint16_t lengths[COBS_PACKET_QUEUE_SLOTS];
+  volatile uint8_t write_idx;
+  volatile uint8_t read_idx;
+  volatile uint8_t count;
+} cobs_packet_queue_t;
 
-ringbuffer_t uart1_rx_ringbuffer;
+cobs_packet_queue_t cobs_rx_queue;
+
+/* COBS packet reception state machine */
+typedef enum {
+  COBS_STATE_WAIT_START_DELIMITER,  /* Waiting for 0x00 start */
+  COBS_STATE_RECEIVING,              /* Receiving packet data */
+} cobs_rx_state_t;
+
+cobs_rx_state_t cobs_rx_state = COBS_STATE_WAIT_START_DELIMITER;
+uint8_t cobs_rx_temp_buffer[COBS_MAX_PACKET_SIZE + 2]; /* Temp buffer for incoming COBS data */
+uint16_t cobs_rx_temp_idx = 0;
+
+volatile uint8_t cobs_ready_to_receive = 1; /* Flag: ready to receive new packet */
 
 /* USER CODE END PV */
 
@@ -228,27 +243,41 @@ void init_hann_window(void)
 }
 
 /*
-RINGBUFFER
+COBS PACKET QUEUE
 */
 
-static inline uint16_t ringbuffer_count(const ringbuffer_t* rb) {
-  return rb->write_head - rb->read_head;
+static inline void cobs_packet_queue_init(cobs_packet_queue_t* q) {
+  q->write_idx = 0;
+  q->read_idx = 0;
+  q->count = 0;
 }
 
-static inline int ringbuffer_write(ringbuffer_t* rb, const uint8_t* input, uint16_t len) {
-  if (len > RINGBUFFER_SIZE - ringbuffer_count(rb)) return -1;
-  for (uint16_t i = 0; i < len; i++) {
-    rb->data[rb->write_head % RINGBUFFER_SIZE] = input[i];
-    rb->write_head++;
-  }
+static inline uint8_t cobs_packet_queue_has_space(const cobs_packet_queue_t* q) {
+  return q->count < COBS_PACKET_QUEUE_SLOTS;
+}
+
+static inline uint8_t cobs_packet_queue_has_packet(const cobs_packet_queue_t* q) {
+  return q->count > 0;
+}
+
+static inline int cobs_packet_queue_push(cobs_packet_queue_t* q, const uint8_t* data, uint16_t len) {
+  if (!cobs_packet_queue_has_space(q)) return -1;
+  if (len > COBS_MAX_PACKET_SIZE) return -1;
+  memcpy(q->data[q->write_idx], data, len);
+  q->lengths[q->write_idx] = len;
+  q->write_idx = (q->write_idx + 1) % COBS_PACKET_QUEUE_SLOTS;
+  q->count++;
   return 0;
 }
 
-static inline int ringbuffer_read_byte(ringbuffer_t* rb, uint8_t* out) {
-  if (rb->write_head == rb->read_head) return 0;
-  *out = rb->data[rb->read_head % RINGBUFFER_SIZE];
-  rb->read_head++;
-  return 1;
+static inline uint16_t cobs_packet_queue_pop(cobs_packet_queue_t* q, uint8_t* out, uint16_t max_len) {
+  if (!cobs_packet_queue_has_packet(q)) return 0;
+  uint16_t len = q->lengths[q->read_idx];
+  if (len > max_len) len = max_len;
+  memcpy(out, q->data[q->read_idx], len);
+  q->read_idx = (q->read_idx + 1) % COBS_PACKET_QUEUE_SLOTS;
+  q->count--;
+  return len;
 }
 
 /*
@@ -307,6 +336,58 @@ static int16_t cobs_decode(const uint8_t* input, uint16_t len, uint8_t* output) 
   }
 
   return write_idx;
+}
+
+/*
+COBS FLOW CONTROL
+*/
+
+static uint8_t cobs_ready_msg[] = {0x00, 0x01, 0x00};  /* COBS-encoded empty "ready" packet */
+
+static void cobs_send_ready(void) {
+  if (uart1_tx_complete && cobs_packet_queue_has_space(&cobs_rx_queue)) {
+    uart1_tx_complete = 0;
+    HAL_UART_Transmit_DMA(&huart1, cobs_ready_msg, sizeof(cobs_ready_msg));
+  }
+}
+
+static void cobs_process_received_data(const uint8_t* data, uint16_t len) {
+  for (uint16_t i = 0; i < len; i++) {
+    uint8_t byte = data[i];
+
+    switch (cobs_rx_state) {
+      case COBS_STATE_WAIT_START_DELIMITER:
+        if (byte == 0x00) {
+          cobs_rx_state = COBS_STATE_RECEIVING;
+          cobs_rx_temp_idx = 0;
+        }
+        break;
+
+      case COBS_STATE_RECEIVING:
+        if (byte == 0x00) {
+          /* End delimiter - decode and store packet */
+          if (cobs_rx_temp_idx > 0 && cobs_packet_queue_has_space(&cobs_rx_queue)) {
+            uint8_t decoded[COBS_MAX_PACKET_SIZE];
+            int16_t decoded_len = cobs_decode(cobs_rx_temp_buffer, cobs_rx_temp_idx, decoded);
+            if (decoded_len > 0) {
+              cobs_packet_queue_push(&cobs_rx_queue, decoded, decoded_len);
+            }
+          }
+          cobs_rx_state = COBS_STATE_WAIT_START_DELIMITER;
+          cobs_rx_temp_idx = 0;
+        } else {
+          /* Store byte if buffer not full */
+          if (cobs_rx_temp_idx < COBS_MAX_PACKET_SIZE + 2) {
+            cobs_rx_temp_buffer[cobs_rx_temp_idx++] = byte;
+          } else {
+            /* Buffer overflow - reset state machine */
+            cobs_rx_state = COBS_STATE_WAIT_START_DELIMITER;
+            cobs_rx_temp_idx = 0;
+          }
+        }
+        break;
+    }
+  }
 }
 
 /*
@@ -431,18 +512,18 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   if (huart->Instance == USART1)
   {
-    uart1_rx_len = Size;
-    uart1_rx_flag = 1;
-    // Restart DMA reception for next message
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart1_rx_buffer, UART_RX_BUFFER_SIZE);
-    __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
+    /* Process COBS-encoded data */
+    cobs_process_received_data(uart1_rx_buffer, Size);
+    /* Restart DMA reception */
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart1_rx_buffer, UART_PACKET_SIZE);
+    __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
   }
   else if (huart->Instance == USART2)
   {
     uart2_rx_len = Size;
     uart2_rx_flag = 1;
     // Restart DMA reception for next message
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart2_rx_buffer, UART_RX_BUFFER_SIZE);
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart2_rx_buffer, UART_PACKET_SIZE);
     __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
   }
   else if (huart->Instance == USART3)
@@ -450,7 +531,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     uart3_rx_len = Size;
     uart3_rx_flag = 1;
     // Restart DMA reception for next message
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uart3_rx_buffer, UART_RX_BUFFER_SIZE);
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uart3_rx_buffer, UART_PACKET_SIZE);
     __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
   }
 }
@@ -493,14 +574,17 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  // Initialize COBS packet queue
+  cobs_packet_queue_init(&cobs_rx_queue);
+
   // Start UART DMA reception with IDLE line detection
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart1_rx_buffer, UART_RX_BUFFER_SIZE);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart1_rx_buffer, UART_PACKET_SIZE);
   __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
 
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart2_rx_buffer, UART_RX_BUFFER_SIZE);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, uart2_rx_buffer, UART_PACKET_SIZE);
   __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
 
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uart3_rx_buffer, UART_RX_BUFFER_SIZE);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart3, uart3_rx_buffer, UART_PACKET_SIZE);
   __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
 
   uint8_t uart_ready_msg[] = "UART DMA IDLE detection started\r\n";
@@ -539,6 +623,9 @@ int main(void)
     uint8_t adc_err[] = "ADC DMA start FAILED!\r\n";
     HAL_UART_Transmit(&huart2, adc_err, sizeof(adc_err) - 1, 100);
   }
+
+  // Send initial ready message to indicate we can receive COBS packets
+  cobs_send_ready();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -549,6 +636,27 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     poll_uart();
+
+    // Process COBS packets from queue
+    if (cobs_packet_queue_has_packet(&cobs_rx_queue)) {
+      uint8_t packet[COBS_MAX_PACKET_SIZE];
+      uint16_t packet_len = cobs_packet_queue_pop(&cobs_rx_queue, packet, COBS_MAX_PACKET_SIZE);
+      if (packet_len > 0) {
+        // TODO: Process the decoded packet here
+        // For now, echo packet info to UART2 for debugging
+        char msg[64];
+        int len = sprintf(msg, "COBS packet received: %d bytes\r\n", packet_len);
+        HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 100);
+      }
+
+      // Send ready message if there's space for more packets
+      cobs_send_ready();
+    }
+
+    // Periodically check if we can send ready (in case TX completed)
+    if (uart1_tx_complete && cobs_packet_queue_has_space(&cobs_rx_queue)) {
+      cobs_send_ready();
+    }
 
     // Check if buffer is half full
     if (buffer_half_full_flag)
