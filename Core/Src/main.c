@@ -109,6 +109,16 @@ volatile uint16_t uart1_rx_len = 0;
 volatile uint16_t uart2_rx_len = 0;
 volatile uint16_t uart3_rx_len = 0;
 
+#define RINGBUFFER_SIZE 2048
+
+typedef struct {
+  volatile uint16_t write_head;
+  volatile uint16_t read_head;
+  uint8_t data[RINGBUFFER_SIZE];
+} ringbuffer_t;
+
+ringbuffer_t uart1_rx_ringbuffer;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -218,6 +228,30 @@ void init_hann_window(void)
 }
 
 /*
+RINGBUFFER
+*/
+
+static inline uint16_t ringbuffer_count(const ringbuffer_t* rb) {
+  return rb->write_head - rb->read_head;
+}
+
+static inline int ringbuffer_write(ringbuffer_t* rb, const uint8_t* input, uint16_t len) {
+  if (len > RINGBUFFER_SIZE - ringbuffer_count(rb)) return -1;
+  for (uint16_t i = 0; i < len; i++) {
+    rb->data[rb->write_head % RINGBUFFER_SIZE] = input[i];
+    rb->write_head++;
+  }
+  return 0;
+}
+
+static inline int ringbuffer_read_byte(ringbuffer_t* rb, uint8_t* out) {
+  if (rb->write_head == rb->read_head) return 0;
+  *out = rb->data[rb->read_head % RINGBUFFER_SIZE];
+  rb->read_head++;
+  return 1;
+}
+
+/*
 COBS
 */
 
@@ -285,7 +319,7 @@ void process_fft(uint16_t* input, uint32_t offset)
   uint32_t half_size = FFT_SIZE / 2;
   uint32_t old_data_offset;
 
-  // Determine the offset of the "Old" data 
+  // Determine the offset of the old data 
   if (offset == 0) {
       old_data_offset = half_size;
   } else {
