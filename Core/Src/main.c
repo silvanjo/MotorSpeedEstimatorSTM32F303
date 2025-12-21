@@ -46,6 +46,15 @@
 
 /* Spectrum transmission parameters */
 #define SPECTRUM_BINS 200          /* Number of bins to send (first 200 bins) */
+
+/* MOPA Algorithm parameters */
+#define SAMPLE_RATE 2000.0f        /* Sample rate in Hz */
+#define MIN_OMEGA 10.0f            /* Minimum angular frequency (Hz) */
+#define MAX_OMEGA 100.0f           /* Maximum angular frequency (Hz) */
+#define N_OMEGA 100                /* Number of omega candidates (reduced for embedded) */
+#define N_ORDERS 3                 /* Number of harmonic orders */
+#define SIGMA_HZ 10.0f             /* Gaussian prior smoothing parameter */
+#define PRIOR_WEIGHT 2.0f          /* Weight for Gaussian prior */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -147,6 +156,20 @@ volatile uint16_t spectrum_packet_len = 0;
 
 volatile uint8_t cobs_ready_to_receive = 1; /* Flag: ready to receive new packet */
 
+/* MOPA Algorithm buffers */
+static const uint8_t mopa_orders[N_ORDERS] = {1, 2, 3};  /* Harmonic orders to consider */
+float32_t mopa_omega[N_OMEGA];              /* Omega candidate values */
+float32_t mopa_pdf[N_OMEGA];                /* PDF for current frame */
+float32_t mopa_biased_pdf[N_OMEGA];         /* Biased PDF with Gaussian prior */
+float32_t mopa_prev_ias = 0.0f;             /* Previous IAS estimate for smoothing */
+float32_t mopa_current_ias = 0.0f;          /* Current IAS estimate */
+volatile uint8_t mopa_ias_ready = 0;        /* Flag: IAS estimate ready */
+uint8_t mopa_initialized = 0;               /* Flag: MOPA omega vector initialized */
+
+/* Spectrum parameters (calculated from FFT) */
+float32_t spectrum_df = 0.0f;               /* Frequency resolution (Hz per bin) */
+float32_t spectrum_max_freq = 0.0f;         /* Maximum frequency in spectrum */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -157,8 +180,16 @@ static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+
 /* USER CODE BEGIN PFP */
 static void prepare_spectrum_packet(void);
+
+/* MOPA function prototypes */
+static void mopa_init(void);
+static void normalize_spectrum(void);
+static float32_t interp_spectrum(float32_t freq);
+static void compute_pdf_map(void);
+static float32_t extract_ias(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -351,10 +382,6 @@ static int16_t cobs_decode(const uint8_t* input, uint16_t len, uint8_t* output) 
   return write_idx;
 }
 
-/*
-COBS FLOW CONTROL
-*/
-
 static uint8_t cobs_ready_msg[] = {0x00, 0x01, 0x00};  /* COBS-encoded empty "ready" packet */
 
 static void cobs_send_ready(void) {
@@ -450,7 +477,7 @@ void process_fft(uint16_t* input, uint32_t offset)
   // Calculate magnitude spectrum
   arm_cmplx_mag_f32(fft_output, fft_magnitude, FFT_SIZE / 2);
 
-  // Normalize the magnitude spectrum
+  // Normalize the magnitude spectrum (for FFT scaling)
   float32_t norm_factor = 2.0f / (float32_t)FFT_SIZE;
   for (uint32_t i = 0; i < FFT_SIZE / 2; i++) {
     fft_magnitude[i] *= norm_factor;
@@ -458,6 +485,159 @@ void process_fft(uint16_t* input, uint32_t offset)
 
   // Prepare spectrum packet for transmission
   prepare_spectrum_packet();
+
+  // Run MOPA algorithm
+  if (mopa_initialized) {
+    // Normalize spectrum for MOPA (RMS normalization)
+    normalize_spectrum();
+
+    // Compute PDF map
+    compute_pdf_map();
+
+    // Extract IAS estimate
+    mopa_current_ias = extract_ias();
+    mopa_prev_ias = mopa_current_ias;
+    mopa_ias_ready = 1;
+  }
+}
+
+/* Initialize MOPA algorithm - compute omega vector and spectrum parameters */
+static void mopa_init(void) {
+  /* Compute omega candidate vector */
+  float32_t d_omega = (MAX_OMEGA - MIN_OMEGA) / (float32_t)(N_OMEGA - 1);
+  for (uint16_t i = 0; i < N_OMEGA; i++) {
+    mopa_omega[i] = MIN_OMEGA + i * d_omega;
+  }
+
+  /* Compute spectrum parameters based on FFT size and sample rate */
+  spectrum_df = SAMPLE_RATE / (float32_t)FFT_SIZE;
+  spectrum_max_freq = spectrum_df * ((float32_t)FFT_SIZE / 2.0f - 1.0f);
+
+  mopa_initialized = 1;
+}
+
+/* Normalize the magnitude spectrum by its RMS value */
+static void normalize_spectrum(void) {
+  float32_t sum_sq = 0.0f;
+  uint16_t n_bins = FFT_SIZE / 2;
+
+  /* Calculate sum of squares */
+  for (uint16_t i = 0; i < n_bins; i++) {
+    sum_sq += fft_magnitude[i] * fft_magnitude[i];
+  }
+
+  /* Calculate RMS and normalize */
+  float32_t rms;
+  arm_sqrt_f32(sum_sq / (float32_t)n_bins, &rms);
+
+  if (rms > 1e-10f) {
+    float32_t inv_rms = 1.0f / rms;
+    for (uint16_t i = 0; i < n_bins; i++) {
+      fft_magnitude[i] *= inv_rms;
+    }
+  }
+}
+
+/* Linear interpolation of spectrum at a given frequency */
+static float32_t interp_spectrum(float32_t freq) {
+  /* Handle boundary cases */
+  if (freq <= 0.0f) {
+    return fft_magnitude[0];
+  }
+  if (freq >= spectrum_max_freq) {
+    return fft_magnitude[FFT_SIZE / 2 - 1];
+  }
+
+  /* Calculate bin index */
+  float32_t bin_float = freq / spectrum_df;
+  uint16_t idx = (uint16_t)bin_float;
+
+  if (idx >= FFT_SIZE / 2 - 1) {
+    idx = FFT_SIZE / 2 - 2;
+  }
+
+  /* Linear interpolation */
+  float32_t f0 = idx * spectrum_df;
+  float32_t f1 = (idx + 1) * spectrum_df;
+  float32_t v0 = fft_magnitude[idx];
+  float32_t v1 = fft_magnitude[idx + 1];
+
+  float32_t t = (freq - f0) / (f1 - f0);
+  return v0 + t * (v1 - v0);
+}
+
+/* Compute PDF map for all omega candidates */
+static void compute_pdf_map(void) {
+  float32_t max_log = -1e30f;
+
+  /* Compute log-PDF for each omega candidate */
+  for (uint16_t i = 0; i < N_OMEGA; i++) {
+    float32_t w = mopa_omega[i];
+    float32_t log_pdf = 0.0f;
+
+    /* Sum log of spectrum values at harmonic frequencies */
+    for (uint8_t o = 0; o < N_ORDERS; o++) {
+      float32_t freq = mopa_orders[o] * w;
+      if (freq < spectrum_max_freq) {
+        float32_t s = interp_spectrum(freq);
+        if (s < 1e-10f) s = 1e-10f;
+        log_pdf += logf(s);
+      }
+    }
+
+    mopa_pdf[i] = log_pdf;
+    if (log_pdf > max_log) {
+      max_log = log_pdf;
+    }
+  }
+
+  /* Convert to linear scale and normalize */
+  float32_t sum = 0.0f;
+  for (uint16_t i = 0; i < N_OMEGA; i++) {
+    float32_t val = expf(mopa_pdf[i] - max_log);
+    mopa_pdf[i] = val;
+    sum += val;
+  }
+
+  if (sum > 0.0f) {
+    float32_t inv_sum = 1.0f / sum;
+    for (uint16_t i = 0; i < N_OMEGA; i++) {
+      mopa_pdf[i] *= inv_sum;
+    }
+  }
+}
+
+/* Extract IAS estimate using Gaussian prior smoothing */
+static float32_t extract_ias(void) {
+  float32_t max_val = 0.0f;
+  uint16_t peak_idx = 0;
+
+  if (mopa_prev_ias == 0.0f) {
+    /* First frame: simple argmax */
+    for (uint16_t i = 0; i < N_OMEGA; i++) {
+      if (mopa_pdf[i] > max_val) {
+        max_val = mopa_pdf[i];
+        peak_idx = i;
+      }
+    }
+  } else {
+    /* Subsequent frames: apply Gaussian prior biasing */
+    float32_t sigma_sq_2 = 2.0f * SIGMA_HZ * SIGMA_HZ;
+
+    for (uint16_t i = 0; i < N_OMEGA; i++) {
+      float32_t w = mopa_omega[i];
+      float32_t diff = w - mopa_prev_ias;
+      float32_t gaussian = expf(-(diff * diff) / sigma_sq_2);
+      mopa_biased_pdf[i] = mopa_pdf[i] * (1.0f + PRIOR_WEIGHT * gaussian);
+
+      if (mopa_biased_pdf[i] > max_val) {
+        max_val = mopa_biased_pdf[i];
+        peak_idx = i;
+      }
+    }
+  }
+
+  return mopa_omega[peak_idx];
 }
 
 /* Prepare spectrum data for transmission via UART3 */
@@ -615,6 +795,11 @@ int main(void)
   uint8_t window_msg[] = "Hann window initialized\r\n";
   HAL_UART_Transmit(&huart2, window_msg, sizeof(window_msg) - 1, 100);
 
+  // Initialize MOPA algorithm
+  mopa_init();
+  uint8_t mopa_msg[] = "MOPA algorithm initialized\r\n";
+  HAL_UART_Transmit(&huart2, mopa_msg, sizeof(mopa_msg) - 1, 100);
+
   // Calibrate ADC
   HAL_StatusTypeDef cal_status = HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   if (cal_status == HAL_OK)
@@ -658,15 +843,18 @@ int main(void)
       spectrum_ready_to_send = 0;
       uart3_tx_complete = 0;
       HAL_UART_Transmit_DMA(&huart3, spectrum_tx_buffer, spectrum_packet_len);
+    }
 
-      // Debug: log spectrum transmission with first bytes
-      char dbg[100];
-      int dbg_len = sprintf(dbg, "TX spectrum: %d bytes [%02X %02X %02X %02X %02X...]\r\n",
-                            spectrum_packet_len,
-                            spectrum_tx_buffer[0], spectrum_tx_buffer[1],
-                            spectrum_tx_buffer[2], spectrum_tx_buffer[3],
-                            spectrum_tx_buffer[4]);
-      HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dbg_len, 100);
+    // Output IAS estimate when ready
+    if (mopa_ias_ready) {
+      mopa_ias_ready = 0;
+      // Convert float to integer parts (sprintf float support may be disabled)
+      int ias_int = (int)mopa_current_ias;
+      int ias_frac = (int)((mopa_current_ias - ias_int) * 100);
+      if (ias_frac < 0) ias_frac = -ias_frac;
+      char ias_msg[64];
+      int ias_len = sprintf(ias_msg, "IAS: %d.%02d Hz\r\n", ias_int, ias_frac);
+      HAL_UART_Transmit(&huart2, (uint8_t*)ias_msg, ias_len, 100);
     }
 
     // Process incoming COBS packets from queue 
