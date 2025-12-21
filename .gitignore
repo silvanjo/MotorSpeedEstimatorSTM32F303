@@ -52,7 +52,5 @@ Thumbs.db
 # Markdown files
 *.md
 
-# Python scripts
-*.py
-__pycache__/
-*.pyc
+# Utility scripts directory
+Utility/

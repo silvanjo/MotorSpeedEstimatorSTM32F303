@@ -43,6 +43,9 @@
 
 #define COBS_MAX_PACKET_SIZE UART_PACKET_SIZE
 #define COBS_PACKET_QUEUE_SLOTS 8
+
+/* Spectrum transmission parameters */
+#define SPECTRUM_BINS 200          /* Number of bins to send (first 200 bins) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,17 +69,22 @@ DMA_HandleTypeDef hdma_usart3_tx;
 
 /* USER CODE BEGIN PV */
 
-bool input_adc = true;    /* If true the input buffer will be filled with data from the adc */
-bool input_uart = false;  /* If true the input buffer will be filled with data from uart */
+bool input_adc = false;   /* If true the input buffer will be filled with data from the adc */
+bool input_uart = true;   /* If true the input buffer will be filled with data from uart */
 
 /* 
 This is the input buffer for the MOPA algorithm. It will either be filled using
-ADC or with data send from UART. 
+ADC or with data send from UART.
 */
-uint16_t input_buffer[ADC_BUFFER_SIZE];
+uint16_t adc_input_buffer[ADC_BUFFER_SIZE];    /* Input buffer filled by ADC DMA */
+uint16_t uart_input_buffer[ADC_BUFFER_SIZE];   /* Input buffer filled from UART1 packets */
+volatile uint16_t uart_input_write_idx = 0;    /* Write index for UART input buffer */
 
 volatile uint8_t buffer_half_full_flag = 0;
 volatile uint8_t buffer_full_flag = 0;
+volatile uint8_t uart_buffer_half_full_flag = 0;  /* Flag: UART buffer first half ready */
+volatile uint8_t uart_buffer_full_flag = 0;       /* Flag: UART buffer completely full */
+volatile uint8_t uart_buffer_initialized = 0;     /* Flag: UART buffer has been filled at least once */
 
 // FFT buffers and instance
 float32_t fft_input[FFT_SIZE];
@@ -132,6 +140,11 @@ cobs_rx_state_t cobs_rx_state = COBS_STATE_WAIT_START_DELIMITER;
 uint8_t cobs_rx_temp_buffer[COBS_MAX_PACKET_SIZE + 2]; /* Temp buffer for incoming COBS data */
 uint16_t cobs_rx_temp_idx = 0;
 
+/* Spectrum transmission buffer and state */
+uint8_t spectrum_tx_buffer[SPECTRUM_BINS * 2 + 20];  /* uint16 data + header + COBS overhead */
+volatile uint8_t spectrum_ready_to_send = 0;
+volatile uint16_t spectrum_packet_len = 0;
+
 volatile uint8_t cobs_ready_to_receive = 1; /* Flag: ready to receive new packet */
 
 /* USER CODE END PV */
@@ -145,7 +158,7 @@ static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void prepare_spectrum_packet(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -435,37 +448,41 @@ void process_fft(uint16_t* input, uint32_t offset)
   arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
 
   // Calculate magnitude spectrum
-  // TODO: I think only half of the fft length is required
-  arm_cmplx_mag_f32(fft_output, fft_magnitude, FFT_SIZE);
+  arm_cmplx_mag_f32(fft_output, fft_magnitude, FFT_SIZE / 2);
 
-  // Find peak frequency (skip DC component at index 0)
-  uint32_t max_index = 5;
-  float32_t max_value = fft_magnitude[1];
-
-  for (uint32_t i = 2; i < FFT_SIZE / 2; i++)  // Only search first half up to Nyquist
-  {
-    if (fft_magnitude[i] > max_value)
-    {
-      max_value = fft_magnitude[i];
-      max_index = i;
-    }
+  // Normalize the magnitude spectrum
+  float32_t norm_factor = 2.0f / (float32_t)FFT_SIZE;
+  for (uint32_t i = 0; i < FFT_SIZE / 2; i++) {
+    fft_magnitude[i] *= norm_factor;
   }
 
-  // Calculate frequency in Hz
-  // Sample rate = 72MHz / (601.5 + 12.5) ADC cycles = 72MHz / 614 = ~117.3 kSPS
-  const float32_t sample_rate = 117300.0f;  // Hz
-  float32_t frequency_resolution = sample_rate / FFT_SIZE;
-  float32_t peak_frequency = max_index * frequency_resolution;
+  // Prepare spectrum packet for transmission
+  prepare_spectrum_packet();
+}
 
-  // Send peak frequency via UART
-  char msg[120];
-  int freq_hz = (int)peak_frequency;
-  int freq_decimal = (int)((peak_frequency - freq_hz) * 100.0f);  // 2 decimal places
-  int magnitude_int = (int)max_value;
+/* Prepare spectrum data for transmission via UART3 */
+static void prepare_spectrum_packet(void) {
+  /* Packet format: [0x01=spectrum_id] [bin_count_low] [bin_count_high] [uint16 data...] */
+  uint8_t raw_packet[SPECTRUM_BINS * 2 + 3];
+  raw_packet[0] = 0x01;  /* Packet type: spectrum */
+  raw_packet[1] = SPECTRUM_BINS & 0xFF;
+  raw_packet[2] = (SPECTRUM_BINS >> 8) & 0xFF;
 
-  int len = sprintf(msg, "Peak Frequency: %d.%02d Hz (bin %u, magnitude: %d)\r\n",
-                    freq_hz, freq_decimal, (unsigned int)max_index, magnitude_int);
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, len, 1000);
+  /* Convert float magnitudes to uint16 */
+  for (uint16_t i = 0; i < SPECTRUM_BINS; i++) {
+    float32_t mag = fft_magnitude[i];
+    uint16_t val = (mag > 65535.0f) ? 65535 : (uint16_t)mag;
+    raw_packet[3 + i * 2] = val & 0xFF;
+    raw_packet[3 + i * 2 + 1] = (val >> 8) & 0xFF;
+  }
+
+  /* COBS encode and frame */
+  spectrum_tx_buffer[0] = 0x00;  /* Start delimiter */
+  uint16_t encoded_len = cobs_encode(raw_packet, SPECTRUM_BINS * 2 + 3, &spectrum_tx_buffer[1]);
+  spectrum_tx_buffer[1 + encoded_len] = 0x00;  /* End delimiter */
+
+  spectrum_packet_len = encoded_len + 2;
+  spectrum_ready_to_send = 1;
 }
 
 /*
@@ -588,7 +605,7 @@ int main(void)
   __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);  // Disable half-transfer interrupt
 
   uint8_t uart_ready_msg[] = "UART DMA IDLE detection started\r\n";
-  HAL_UART_Transmit(&huart3, uart_ready_msg, sizeof(uart_ready_msg) - 1, 100);
+  HAL_UART_Transmit(&huart2, uart_ready_msg, sizeof(uart_ready_msg) - 1, 100);
 
   // Initialize FFT instance
   arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
@@ -596,32 +613,32 @@ int main(void)
   // Initialize Hann window coefficients for spectral leakage reduction
   init_hann_window();
   uint8_t window_msg[] = "Hann window initialized\r\n";
-  HAL_UART_Transmit(&huart3, window_msg, sizeof(window_msg) - 1, 100);
+  HAL_UART_Transmit(&huart2, window_msg, sizeof(window_msg) - 1, 100);
 
   // Calibrate ADC
   HAL_StatusTypeDef cal_status = HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   if (cal_status == HAL_OK)
   {
     uint8_t cal_ok[] = "ADC calibration successful\r\n";
-    HAL_UART_Transmit(&huart3, cal_ok, sizeof(cal_ok) - 1, 100);
+    HAL_UART_Transmit(&huart2, cal_ok, sizeof(cal_ok) - 1, 100);
   }
   else
   {
     uint8_t cal_err[] = "ADC calibration FAILED!\r\n";
-    HAL_UART_Transmit(&huart3, cal_err, sizeof(cal_err) - 1, 100);
+    HAL_UART_Transmit(&huart2, cal_err, sizeof(cal_err) - 1, 100);
   }
 
   // Start ADC with DMA
-  HAL_StatusTypeDef adc_status = HAL_ADC_Start_DMA(&hadc1, (uint32_t*) input_buffer, ADC_BUFFER_SIZE);
+  HAL_StatusTypeDef adc_status = HAL_ADC_Start_DMA(&hadc1, (uint32_t*) adc_input_buffer, ADC_BUFFER_SIZE);
   if (adc_status == HAL_OK)
   {
     uint8_t adc_ok[] = "ADC DMA started successfully\r\n";
-    HAL_UART_Transmit(&huart3, adc_ok, sizeof(adc_ok) - 1, 100);
+    HAL_UART_Transmit(&huart2, adc_ok, sizeof(adc_ok) - 1, 100);
   }
   else
   {
     uint8_t adc_err[] = "ADC DMA start FAILED!\r\n";
-    HAL_UART_Transmit(&huart3, adc_err, sizeof(adc_err) - 1, 100);
+    HAL_UART_Transmit(&huart2, adc_err, sizeof(adc_err) - 1, 100);
   }
 
   // Send initial ready message to indicate we can receive COBS packets
@@ -635,50 +652,102 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // poll_uart();
 
-    // Process COBS packets from queue - echo on UART2
-    if (cobs_packet_queue_has_packet(&cobs_rx_queue) && uart2_tx_complete) {
+    // Send spectrum data on UART3 when ready
+    if (spectrum_ready_to_send && uart3_tx_complete) {
+      spectrum_ready_to_send = 0;
+      uart3_tx_complete = 0;
+      HAL_UART_Transmit_DMA(&huart3, spectrum_tx_buffer, spectrum_packet_len);
+
+      // Debug: log spectrum transmission with first bytes
+      char dbg[100];
+      int dbg_len = sprintf(dbg, "TX spectrum: %d bytes [%02X %02X %02X %02X %02X...]\r\n",
+                            spectrum_packet_len,
+                            spectrum_tx_buffer[0], spectrum_tx_buffer[1],
+                            spectrum_tx_buffer[2], spectrum_tx_buffer[3],
+                            spectrum_tx_buffer[4]);
+      HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dbg_len, 100);
+    }
+
+    // Process incoming COBS packets from queue 
+    if (cobs_packet_queue_has_packet(&cobs_rx_queue)) {
       uint8_t packet[COBS_MAX_PACKET_SIZE];
       uint16_t packet_len = cobs_packet_queue_pop(&cobs_rx_queue, packet, COBS_MAX_PACKET_SIZE);
       if (packet_len > 0) {
-        // Debug: log that we're echoing
-        char dbg[64];
-        int dbg_len = sprintf(dbg, "Echoing %d bytes on UART2\r\n", packet_len);
-        HAL_UART_Transmit(&huart3, (uint8_t*)dbg, dbg_len, 100);
+        // Check packet type
+        uint8_t packet_type = packet[0];
 
-        // Echo received packet back as COBS on UART2 using DMA
-        uart2_tx_buffer[0] = 0x00;  // Start delimiter
-        uint16_t encoded_len = cobs_encode(packet, packet_len, &uart2_tx_buffer[1]);
-        uart2_tx_buffer[1 + encoded_len] = 0x00;  // End delimiter
+        if (packet_type == 0x02) {
+          // Packet type 0x02: UART input data 
+          // Format: [0x02] [sample0_low] [sample0_high] [sample1_low] [sample1_high] ...
+          uint16_t sample_count = (packet_len - 1) / 2;  // Calculate from packet length
 
-        uart2_tx_complete = 0;
-        HAL_UART_Transmit_DMA(&huart2, uart2_tx_buffer, encoded_len + 2);
+          // Copy samples to UART input buffer
+          for (uint16_t i = 0; i < sample_count; i++) {
+            uint16_t idx = 1 + i * 2;
+            uart_input_buffer[uart_input_write_idx] = packet[idx] | (packet[idx + 1] << 8);
+            uart_input_write_idx++;
+
+            // Check if buffer is half full 
+            if (uart_input_write_idx == ADC_BUFFER_SIZE / 2) {
+              uart_buffer_half_full_flag = 1;
+            }
+            // Check if buffer is completely full
+            else if (uart_input_write_idx >= ADC_BUFFER_SIZE) {
+              uart_buffer_full_flag = 1;
+              uart_input_write_idx = 0;  // Reset for next batch
+            }
+          }
+
+          char dbg[64];
+          int dbg_len = sprintf(dbg, "UART data: %d samples, idx=%d\r\n", sample_count, uart_input_write_idx);
+          HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dbg_len, 100);
+        } else {
+          // Unknown packet type
+          char dbg[64];
+          int dbg_len = sprintf(dbg, "Unknown packet type 0x%02X, %d bytes\r\n", packet_type, packet_len);
+          HAL_UART_Transmit(&huart2, (uint8_t*)dbg, dbg_len, 100);
+        }
       }
-
-      // Send ready/ACK on UART1 after queuing the echo
+      // Send ready/ACK on UART1
       cobs_send_ready();
     }
 
-    // Send ready message if UART1 TX complete and queue has space
-    /*
-    if (uart1_tx_complete && cobs_packet_queue_has_space(&cobs_rx_queue)) {
-      cobs_send_ready();
-    }
-    */
-
-    // Check if buffer is half full
-    if (buffer_half_full_flag)
+    // Check if ADC buffer is half full 
+    if (input_adc && buffer_half_full_flag)
     {
       buffer_half_full_flag = 0;
-      // process_fft(input_buffer, 0);
+      process_fft(adc_input_buffer, 0);
     }
 
-    // Check if buffer is full
-    if (buffer_full_flag)
+    // Check if ADC buffer is full 
+    if (input_adc && buffer_full_flag)
     {
       buffer_full_flag = 0;
-      // process_fft(input_buffer, ADC_BUFFER_SIZE / 2);
+      process_fft(adc_input_buffer, ADC_BUFFER_SIZE / 2);
+    }
+
+    // Check if UART buffer is half full
+    // Only process if buffer has been initialized (filled at least once before)
+    if (input_uart && uart_buffer_half_full_flag)
+    {
+      uart_buffer_half_full_flag = 0;
+      if (uart_buffer_initialized) {
+        // Process FFT: old data from second half [1024..2047], new data from first half [0..1023]
+        HAL_UART_Transmit(&huart2, (uint8_t*)"FFT half\r\n", 10, 100);
+        process_fft(uart_input_buffer, 0);
+      }
+    }
+
+    // Check if UART buffer is full
+    if (input_uart && uart_buffer_full_flag)
+    {
+      uart_buffer_full_flag = 0;
+      // Mark buffer as initialized after first complete fill
+      uart_buffer_initialized = 1;
+      // Process FFT: old data from first half [0..1023], new data from second half [1024..2047]
+      HAL_UART_Transmit(&huart2, (uint8_t*)"FFT full\r\n", 10, 100);
+      process_fft(uart_input_buffer, ADC_BUFFER_SIZE / 2);
     }
 
   }
