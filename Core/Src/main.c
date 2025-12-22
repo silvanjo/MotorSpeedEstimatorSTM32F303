@@ -47,6 +47,16 @@
 /* Spectrum transmission parameters */
 #define SPECTRUM_BINS 200          /* Number of bins to send (first 200 bins) */
 
+/* UART3 output control flags (set to 1 to enable, 0 to disable) */
+#define SEND_SPECTRUM 0            /* Send FFT magnitude spectrum */
+#define SEND_PDF 0                 /* Send MOPA PDF */
+#define SEND_IAS 1                 /* Send MOPA IAS estimate */
+
+/* Packet type identifiers */
+#define PACKET_TYPE_SPECTRUM 0x01
+#define PACKET_TYPE_PDF 0x02
+#define PACKET_TYPE_IAS 0x03
+
 /* MOPA Algorithm parameters */
 #define SAMPLE_RATE 2000.0f        /* Sample rate in Hz */
 #define MIN_OMEGA 10.0f            /* Minimum angular frequency (Hz) */
@@ -149,10 +159,9 @@ cobs_rx_state_t cobs_rx_state = COBS_STATE_WAIT_START_DELIMITER;
 uint8_t cobs_rx_temp_buffer[COBS_MAX_PACKET_SIZE + 2]; /* Temp buffer for incoming COBS data */
 uint16_t cobs_rx_temp_idx = 0;
 
-/* Spectrum transmission buffer and state */
-uint8_t spectrum_tx_buffer[SPECTRUM_BINS * 2 + 20];  /* uint16 data + header + COBS overhead */
-volatile uint8_t spectrum_ready_to_send = 0;
-volatile uint16_t spectrum_packet_len = 0;
+/* UART3 output data state */
+volatile uint8_t uart3_data_ready = 0;
+volatile uint16_t uart3_data_len = 0;
 
 volatile uint8_t cobs_ready_to_receive = 1; /* Flag: ready to receive new packet */
 
@@ -182,7 +191,10 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
+/* UART3 output packet preparation */
 static void prepare_spectrum_packet(void);
+static void prepare_pdf_packet(void);
+static void prepare_ias_packet(void);
 
 /* MOPA function prototypes */
 static void mopa_init(void);
@@ -483,9 +495,6 @@ void process_fft(uint16_t* input, uint32_t offset)
     fft_magnitude[i] *= norm_factor;
   }
 
-  // Prepare spectrum packet for transmission
-  prepare_spectrum_packet();
-
   // Run MOPA algorithm
   if (mopa_initialized) {
     // Normalize spectrum for MOPA (RMS normalization)
@@ -499,6 +508,15 @@ void process_fft(uint16_t* input, uint32_t offset)
     mopa_prev_ias = mopa_current_ias;
     mopa_ias_ready = 1;
   }
+
+  // Prepare UART3 output packet based on enabled flags
+  #if SEND_SPECTRUM
+  prepare_spectrum_packet();
+  #elif SEND_PDF
+  prepare_pdf_packet();
+  #elif SEND_IAS
+  prepare_ias_packet();
+  #endif
 }
 
 /* Initialize MOPA algorithm - compute omega vector and spectrum parameters */
@@ -642,27 +660,75 @@ static float32_t extract_ias(void) {
 
 /* Prepare spectrum data for transmission via UART3 */
 static void prepare_spectrum_packet(void) {
-  /* Packet format: [0x01=spectrum_id] [bin_count_low] [bin_count_high] [uint16 data...] */
-  uint8_t raw_packet[SPECTRUM_BINS * 2 + 3];
-  raw_packet[0] = 0x01;  /* Packet type: spectrum */
-  raw_packet[1] = SPECTRUM_BINS & 0xFF;
-  raw_packet[2] = (SPECTRUM_BINS >> 8) & 0xFF;
+  #if SEND_SPECTRUM
+  /* Packet format: [PACKET_TYPE_SPECTRUM] [uint16 data...] */
+  uint8_t raw_packet[SPECTRUM_BINS * 2 + 1];
+  raw_packet[0] = PACKET_TYPE_SPECTRUM;
 
   /* Convert float magnitudes to uint16 */
   for (uint16_t i = 0; i < SPECTRUM_BINS; i++) {
     float32_t mag = fft_magnitude[i];
     uint16_t val = (mag > 65535.0f) ? 65535 : (uint16_t)mag;
-    raw_packet[3 + i * 2] = val & 0xFF;
-    raw_packet[3 + i * 2 + 1] = (val >> 8) & 0xFF;
+    raw_packet[1 + i * 2] = val & 0xFF;
+    raw_packet[1 + i * 2 + 1] = (val >> 8) & 0xFF;
   }
 
   /* COBS encode and frame */
-  spectrum_tx_buffer[0] = 0x00;  /* Start delimiter */
-  uint16_t encoded_len = cobs_encode(raw_packet, SPECTRUM_BINS * 2 + 3, &spectrum_tx_buffer[1]);
-  spectrum_tx_buffer[1 + encoded_len] = 0x00;  /* End delimiter */
+  uart3_tx_buffer[0] = 0x00;  /* Start delimiter */
+  uint16_t encoded_len = cobs_encode(raw_packet, SPECTRUM_BINS * 2 + 1, &uart3_tx_buffer[1]);
+  uart3_tx_buffer[1 + encoded_len] = 0x00;  /* End delimiter */
 
-  spectrum_packet_len = encoded_len + 2;
-  spectrum_ready_to_send = 1;
+  uart3_data_len = encoded_len + 2;
+  uart3_data_ready = 1;
+  #endif
+}
+
+/* Prepare PDF data for transmission via UART3 */
+static void prepare_pdf_packet(void) {
+  #if SEND_PDF
+  /* Packet format: [PACKET_TYPE_PDF] [uint16 data...] */
+  /* PDF values are scaled: val = pdf[i] * 65535 */
+  uint8_t raw_packet[N_OMEGA * 2 + 1];
+  raw_packet[0] = PACKET_TYPE_PDF;
+
+  /* Convert float PDF to uint16 (scaled 0-65535) */
+  for (uint16_t i = 0; i < N_OMEGA; i++) {
+    float32_t pdf_val = mopa_pdf[i] * 65535.0f;
+    uint16_t val = (pdf_val > 65535.0f) ? 65535 : (uint16_t)pdf_val;
+    raw_packet[1 + i * 2] = val & 0xFF;
+    raw_packet[1 + i * 2 + 1] = (val >> 8) & 0xFF;
+  }
+
+  /* COBS encode and frame */
+  uart3_tx_buffer[0] = 0x00;  /* Start delimiter */
+  uint16_t encoded_len = cobs_encode(raw_packet, N_OMEGA * 2 + 1, &uart3_tx_buffer[1]);
+  uart3_tx_buffer[1 + encoded_len] = 0x00;  /* End delimiter */
+
+  uart3_data_len = encoded_len + 2;
+  uart3_data_ready = 1;
+  #endif
+}
+
+/* Prepare IAS data for transmission via UART3 */
+static void prepare_ias_packet(void) {
+  #if SEND_IAS
+  /* Packet format: [PACKET_TYPE_IAS] [ias_low] [ias_high] */
+  /* IAS value scaled: val = ias * 100 (gives 0.01 Hz resolution) */
+  uint8_t raw_packet[3];
+  raw_packet[0] = PACKET_TYPE_IAS;
+
+  uint16_t ias_scaled = (uint16_t)(mopa_current_ias * 100.0f);
+  raw_packet[1] = ias_scaled & 0xFF;
+  raw_packet[2] = (ias_scaled >> 8) & 0xFF;
+
+  /* COBS encode and frame */
+  uart3_tx_buffer[0] = 0x00;  /* Start delimiter */
+  uint16_t encoded_len = cobs_encode(raw_packet, 3, &uart3_tx_buffer[1]);
+  uart3_tx_buffer[1 + encoded_len] = 0x00;  /* End delimiter */
+
+  uart3_data_len = encoded_len + 2;
+  uart3_data_ready = 1;
+  #endif
 }
 
 /*
@@ -838,11 +904,11 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    // Send spectrum data on UART3 when ready
-    if (spectrum_ready_to_send && uart3_tx_complete) {
-      spectrum_ready_to_send = 0;
+    // Send data on UART3 when ready
+    if (uart3_data_ready && uart3_tx_complete) {
+      uart3_data_ready = 0;
       uart3_tx_complete = 0;
-      HAL_UART_Transmit_DMA(&huart3, spectrum_tx_buffer, spectrum_packet_len);
+      HAL_UART_Transmit_DMA(&huart3, uart3_tx_buffer, uart3_data_len);
     }
 
     // Output IAS estimate when ready
