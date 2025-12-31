@@ -27,6 +27,8 @@
 
 #include "arm_math.h"
 #include "stm32f3xx_hal_uart.h"
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -915,6 +917,18 @@ int main(void)
 
   // Send initial ready message to indicate we can receive COBS packets
   cobs_send_ready();
+
+  // Initialize SSD1306 OLED display
+  ssd1306_Init();
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString("Motor Speed", Font_11x18, White);
+  ssd1306_SetCursor(0, 24);
+  ssd1306_WriteString("Waiting...", Font_11x18, White);
+  ssd1306_UpdateScreen();
+  uint8_t oled_msg[] = "OLED initialized\r\n";
+  HAL_UART_Transmit(&huart2, oled_msg, sizeof(oled_msg) - 1, 100);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -952,13 +966,23 @@ int main(void)
     // Output IAS estimate when ready
     if (mopa_ias_ready) {
       mopa_ias_ready = 0;
-      // Convert float to integer parts (sprintf float support may be disabled)
+      // Convert float to integer parts
       int ias_int = (int)mopa_current_ias;
       int ias_frac = (int)((mopa_current_ias - ias_int) * 100);
       if (ias_frac < 0) ias_frac = -ias_frac;
       char ias_msg[64];
       int ias_len = sprintf(ias_msg, "IAS: %d.%02d Hz\r\n", ias_int, ias_frac);
       HAL_UART_Transmit(&huart2, (uint8_t*)ias_msg, ias_len, 100);
+
+      // Display IAS on OLED
+      ssd1306_Fill(Black);
+      ssd1306_SetCursor(0, 0);
+      ssd1306_WriteString("Motor Speed", Font_11x18, White);
+      ssd1306_SetCursor(0, 24);
+      char oled_ias[16];
+      sprintf(oled_ias, "%d.%02d Hz", ias_int, ias_frac);
+      ssd1306_WriteString(oled_ias, Font_16x26, White);
+      ssd1306_UpdateScreen();
     }
 
     // Process incoming COBS packets from queue 

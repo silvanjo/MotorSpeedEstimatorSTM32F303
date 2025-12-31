@@ -14,6 +14,7 @@ target_compile_definitions(stm32cubemx INTERFACE
 
 target_include_directories(stm32cubemx INTERFACE
     ../../Core/Inc
+    ../../Core/Libs/ssd1306
     ../../Drivers/STM32F3xx_HAL_Driver/Inc
     ../../Drivers/STM32F3xx_HAL_Driver/Inc/Legacy
     ../../Drivers/CMSIS/Device/ST/STM32F3xx/Include
@@ -47,6 +48,9 @@ target_sources(stm32cubemx INTERFACE
     ../../Core/Src/sysmem.c
     ../../Core/Src/syscalls.c
     ../../startup_stm32f303xe.s
+    ../../Core/Libs/ssd1306/ssd1306.c
+    ../../Core/Libs/ssd1306/ssd1306_fonts.c
+    ../../Core/Libs/ssd1306/ssd1306_tests.c
 )
 
 target_link_directories(stm32cubemx INTERFACE
