@@ -21,8 +21,6 @@ endif()
 # Set the project name
 set(CMAKE_PROJECT_NAME ADCTest)
 
-# Include toolchain file
-include("cmake/gcc-arm-none-eabi.cmake")
 
 # Enable compile command to ease indexing with e.g. clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
@@ -49,12 +47,15 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    Core/Libs/ssd1306/ssd1306.c
+    Core/Libs/ssd1306/ssd1306_fonts.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     Drivers/CMSIS/DSP/Include
+    Core/Libs/ssd1306
 )
 
 # Add project symbols (macros)
